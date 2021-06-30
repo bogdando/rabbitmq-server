@@ -1,51 +1,71 @@
 version: 2.1
 workflows:
-  build_push:
+  build:
     jobs:
       - build:
-          context:
-            - DOCKER
+          matrix:
+            parameters:
+              use_jepsen: [false, true]
+
 jobs:
   build:
     machine:
       image: ubuntu-2004:202104-01    
 
+    parameters:
+      use_jepsen:
+        type: boolean
+
     environment:
       VAGRANT_VERSION: 2.2.16
-      DOCKER_IMAGE: bogdando/rabbitmq-cluster-ocf
+      DOCKER_IMAGE: bogdando/rabbitmq-cluster-ocf:buster_erl24_rmq38181
       UPLOAD_METHOD: none
       OCF_RA_PROVIDER: rabbitmq
       OCF_RA_TYPE: rabbitmq-server-ha
       STORAGE: /var/tmp/rmq
-      CACHE: /var/tmp/releases
       POLICY_BASE64: IyBUaGlzIHNjcmlwdCBpcyBjYWxsZWQgYnkgcmFiYml0bXEtc2VydmVyLWhhLm9jZiBkdXJpbmcgUmFiYml0TVEKIyBjbHVzdGVyIHN0YXJ0IHVwLiBJdCBpcyBhIGNvbnZlbmllbnQgcGxhY2UgdG8gc2V0IHlvdXIgY2x1c3RlcgojIHBvbGljeSBoZXJlLCBmb3IgZXhhbXBsZToKIyAke09DRl9SRVNLRVlfY3RsfSBzZXRfcG9saWN5IGhhLWFsbCAiLiIgJ3siaGEtbW9kZSI6ImFsbCIsICJoYS1zeW5jLW1vZGUiOiJhdXRvbWF0aWMiLCAiaGEtc3luYy1iYXRjaC1zaXplIjoxMDAwMH0nCgojIEVuYWJsZSBoYS1wb2xpY3kgd2l0aCB0aGUgcmVwbGljYSBmYWN0b3Igb2YgNSBmb3IgamVwc2VuIHF1ZXVlcwpvY2ZfbG9nIGluZm8gIiR7TEh9IFNldHRpbmcgSEEgcG9saWN5IGZvciBhbGwgcXVldWVzIgoke09DRl9SRVNLRVlfY3RsfSBzZXRfcG9saWN5IGhhLWFsbCAiamVwc2VuLiIgJ3siaGEtbW9kZSI6ImV4YWN0bHkiLCAiaGEtcGFyYW1zIjoyLCAiaGEtc3luYy1tb2RlIjoiYXV0b21hdGljIn0nCg==
-      DOCKER_MOUNTS: "${HOME}/${OCF_RA_PROVIDER}:/usr/lib/ocf/resource.d/${OCF_RA_PROVIDER}/${OCF_RA_PROVIDER}:ro jepsen:/jepsen"
       DOCKER_DRIVER: aufs
-      USE_JEPSEN: false
-      QUIET: true
-      SMOKETEST_WAIT: 360
-      CPU: 500
-      MEMORY: 512M
+      USE_JEPSEN:  << parameters.use_jepsen >>
 
     steps:
       - checkout
+      - restore_cache:
+          keys:
+            - rmq_ci_env_v002
       - run:
-          name: smoke test OCF RA
-          command: >
-            if ! git diff HEAD~ --name-only | grep -q scripts/rabbitmq-server-ha.ocf; then exit 0; fi;
-            cp -f scripts/rabbitmq-server-ha.ocf "$HOME/$OCF_RA_PROVIDER";
-            chmod +x "$HOME/$OCF_RA_PROVIDER";
-            sudo apt-get install -qq git wget;
-            echo "Downloading vagrant ${VAGRANT_VERSION}...";
-            if [ ! -f $CACHE/vagrant_${VAGRANT_VERSION}_x86_64.deb ]; then
-            wget --no-verbose "https://releases.hashicorp.com/vagrant/${VAGRANT_VERSION}/vagrant_${VAGRANT_VERSION}_x86_64.deb"
-            -O $CACHE/vagrant_${VAGRANT_VERSION}_x86_64.deb; fi;
-            echo "Installing vagrant ${VAGRANT_VERSION}...";
-            sudo dpkg -i --force-all $CACHE/vagrant_${VAGRANT_VERSION}_x86_64.deb;
-            echo "Pulling docker images...";
-            trap 'rm -f /home/circleci/.docker/config.json' EXIT INT HUP TERM STOP;
-            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin;
-            docker pull $DOCKER_IMAGE;
-            git clone https://github.com/bogdando/rabbitmq-cluster-ocf-vagrant;
-            cd rabbitmq-cluster-ocf-vagrant;
+          name: prepare
+          command: |
+            if ! git diff HEAD~ --name-only | grep -q scripts/rabbitmq-server-ha.ocf; then exit 0; fi
+            if [ -f /var/tmp/releases/all.tar ]; then docker load < /var/tmp/releases/all.tar; fi
+            cp -f scripts/rabbitmq-server-ha.ocf "$HOME/$OCF_RA_PROVIDER"
+            chmod +x "$HOME/$OCF_RA_PROVIDER"
+            sudo apt-get install -qq git wget
+            mkdir -p /var/tmp/releases
+            wget --no-verbose "https://releases.hashicorp.com/vagrant/${VAGRANT_VERSION}/vagrant_${VAGRANT_VERSION}_x86_64.deb" -O "/var/tmp/releases/vagrant_${VAGRANT_VERSION}_x86_64.deb"
+            sudo dpkg -i --force-all "/var/tmp/releases/vagrant_${VAGRANT_VERSION}_x86_64.deb"
+            trap 'rm -f /home/circleci/.docker/config.json' EXIT INT HUP TERM STOP
+            docker pull $DOCKER_IMAGE
+            test -f /var/tmp/releases/all.tar || docker save $(docker images -a --filter='dangling=false' --format '{{.Repository}}:{{.Tag}} {{.ID}}') -o /var/tmp/releases/all.tar
+      - save_cache:
+          key: rmq_ci_env_v002
+          paths:
+            - /var/tmp/releases/all.tar
+      - run:
+          name: run smoke test
+          command: |
+            git clone https://github.com/bogdando/rabbitmq-cluster-ocf-vagrant
+            cd rabbitmq-cluster-ocf-vagrant
+            export DOCKER_MOUNTS="${HOME}/${OCF_RA_PROVIDER}:/usr/lib/ocf/resource.d/${OCF_RA_PROVIDER}/${OCF_RA_TYPE}:ro jepsen:/jepsen"
+            if [ "$USE_JEPSEN" = "true" ]; then
+              export QUIET=false
+              export SMOKETEST_WAIT=3600
+              export CPU=400
+              export MEMORY=450M
+              export NODES="n1 n2 n3"
+            else
+              export QUIET=true
+              export SMOKETEST_WAIT=360
+              export CPU=500
+              export MEMORY=512M
+            fi
             vagrant up
